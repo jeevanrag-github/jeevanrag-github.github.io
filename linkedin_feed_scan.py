@@ -121,16 +121,71 @@ def try_totp(page) -> bool:
         return False
 
 
+def extract_2fa_tap_info(page) -> dict:
+    """Extract Google tap-number 2FA details from the sign-in page."""
+    info: dict = {"tap_number": None, "devices": []}
+    try:
+        body = page.inner_text("body")[:8000]
+    except Exception:
+        return info
+
+    for pattern in (
+        r"tap\s+(?:number\s+)?(\d{1,3})\b",
+        r"number\s+(\d{1,3})\s+on\s+your",
+        r"choose\s+(\d{1,3})\b",
+        r"(\d{2,3})\s+on\s+your\s+(?:phone|device)",
+    ):
+        match = re.search(pattern, body, re.I)
+        if match:
+            info["tap_number"] = match.group(1)
+            break
+
+    for device in re.findall(
+        r"(Galaxy [A-Za-z0-9+ ]+|iPhone \d+[A-Za-z+ ]*|Pixel \d+[A-Za-z+ ]*|"
+        r"iPad(?: Pro)?[A-Za-z0-9+ ]*)",
+        body,
+        re.I,
+    ):
+        cleaned = " ".join(device.split())
+        if cleaned and cleaned not in info["devices"]:
+            info["devices"].append(cleaned)
+
+    return info
+
+
+def emit_tfa_alert(tfa_info: dict) -> None:
+    """Print tap-number alert immediately — must be first visible output during 2FA."""
+    num = tfa_info.get("tap_number") or "???"
+    devices = tfa_info.get("devices") or []
+    device_str = ", ".join(devices) if devices else "your registered phone"
+    line = f"TAP NUMBER: {num} — approve on {device_str} NOW. You have 5 minutes."
+    print(line, flush=True)
+    print(f"TFA_ALERT|tap={num}|devices={device_str}", flush=True)
+    sys.stdout.flush()
+
+
+def _active_google_page(page, google_page):
+    try:
+        if google_page and not google_page.is_closed():
+            return google_page
+    except Exception:
+        pass
+    return page
+
+
 def wait_for_auth_completion(page, google_page, context) -> dict:
     """Poll up to 5 minutes while user approves phone 2FA on their device."""
     deadline = time.time() + TFA_MAX_WAIT_SECONDS
     elapsed = 0
     challenge_seen = False
+    tfa_alert_sent = False
+    tfa_info_cached: dict = {}
 
     while time.time() < deadline:
         elapsed = TFA_MAX_WAIT_SECONDS - int(deadline - time.time())
+        active_google = _active_google_page(page, google_page)
 
-        for active in {page, google_page}:
+        for active in {page, active_google}:
             try:
                 if has_li_at(context):
                     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
@@ -147,13 +202,30 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
             except Exception:
                 pass
 
-        on_challenge = page_looks_like_challenge(google_page) or page_looks_like_challenge(page)
+        on_challenge = page_looks_like_challenge(active_google) or page_looks_like_challenge(page)
         if on_challenge:
             challenge_seen = True
-            if try_totp(google_page):
+            if try_totp(active_google):
                 continue
-            screenshot(google_page, f"2fa_wait_{elapsed}s")
-            print(f"Waiting for 2FA approval on your phone... ({elapsed}s / {TFA_MAX_WAIT_SECONDS}s)")
+
+            tfa_info = extract_2fa_tap_info(active_google)
+            if not tfa_info.get("tap_number"):
+                tfa_info = extract_2fa_tap_info(page)
+
+            if tfa_info.get("tap_number") and not tfa_alert_sent:
+                emit_tfa_alert(tfa_info)
+                tfa_alert_sent = True
+                tfa_info_cached = tfa_info
+                screenshot(active_google, "2fa_alert")
+            elif tfa_alert_sent and elapsed > 0 and elapsed % 30 == 0:
+                emit_tfa_alert(tfa_info_cached)
+                screenshot(active_google, f"2fa_wait_{elapsed}s")
+            elif not tfa_alert_sent:
+                screenshot(active_google, f"2fa_wait_{elapsed}s")
+                print(
+                    f"TAP NUMBER: ??? — check 2fa_alert screenshot. Waiting ({elapsed}s / {TFA_MAX_WAIT_SECONDS}s)",
+                    flush=True,
+                )
         elif not challenge_seen and elapsed > 15:
             break
 
