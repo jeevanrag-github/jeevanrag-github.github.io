@@ -131,12 +131,16 @@ def try_totp(page) -> bool:
 
 
 def extract_2fa_tap_info(page) -> dict:
-    """Extract Google tap-number 2FA details from the sign-in page."""
-    info: dict = {"tap_number": None, "devices": []}
+    """Extract Google 2FA details from the sign-in page (tap-number or tap-yes prompts)."""
+    info: dict = {"tap_number": None, "devices": [], "prompt_type": "number"}
     try:
         body = page.inner_text("body")[:8000]
     except Exception:
         return info
+
+    if re.search(r"tap\s+yes|check your .+?\n|sent a notification", body, re.I):
+        info["prompt_type"] = "yes"
+        info["tap_number"] = "YES"
 
     for pattern in (
         r"tap\s+(?:number\s+)?(\d{1,3})\b",
@@ -147,6 +151,7 @@ def extract_2fa_tap_info(page) -> dict:
         match = re.search(pattern, body, re.I)
         if match:
             info["tap_number"] = match.group(1)
+            info["prompt_type"] = "number"
             break
 
     for device in re.findall(
