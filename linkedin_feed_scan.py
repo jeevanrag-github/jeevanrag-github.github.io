@@ -13,10 +13,16 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 SESSION_DIR = Path("/workspace/.linkedin_session")
 SESSION_FILE = SESSION_DIR / "state.json"
 OUTPUT_FILE = Path("/workspace/feed_results.json")
+SCREENSHOT_DIR = Path("/workspace/login_screenshots")
 
 EMAIL = os.environ.get("LINKEDIN_EMAIL", "")
 PASSWORD = os.environ.get("GOOGLE_PASSORD", "")
 AUTH_METHOD = os.environ.get("LINKEDIN_AUTH_METHOD", "")
+LI_AT = os.environ.get("LINKEDIN_LI_AT", "")
+TOTP_SECRET = os.environ.get("GOOGLE_TOTP_SECRET", "")
+
+TFA_POLL_SECONDS = 10
+TFA_MAX_WAIT_SECONDS = 300
 
 SKIP_KEYWORDS = re.compile(
     r"\b(hiring now|we're hiring|apply now|job opening|limited time offer|"
@@ -35,6 +41,19 @@ POLITICAL = re.compile(
     r"immigration ban|culture war)\b",
     re.I,
 )
+CHALLENGE_HINTS = (
+    "challenge",
+    "signin/v2/challenge",
+    "totp",
+    "verify",
+    "captcha",
+    "recaptcha",
+    "2-step",
+    "two-step",
+    "phone number",
+    "tap yes",
+    "check your",
+)
 
 
 def save_state(context):
@@ -42,120 +61,185 @@ def save_state(context):
     context.storage_state(path=str(SESSION_FILE))
 
 
+def screenshot(page, name: str):
+    try:
+        SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(SCREENSHOT_DIR / f"{name}.png"))
+    except Exception:
+        pass
+
+
 def has_li_at(context) -> bool:
     cookies = context.cookies("https://www.linkedin.com")
     return any(c["name"] == "li_at" and c["value"] for c in cookies)
 
 
-def login_via_google(page, context) -> dict:
-    """Return {status, reason}."""
-    page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(3000)
-
-    if "feed" in page.url:
-        return {"status": "success", "reason": "already logged in"}
-
-    google_page = page
-    clicked = False
-
-    # Google Identity Services button is rendered inside a visible iframe overlay
-    iframe = page.locator('iframe[title*="Sign in with Google"]').last
-    try:
-        iframe.wait_for(state="attached", timeout=10000)
-        with page.expect_popup(timeout=20000) as popup_info:
-            iframe.click(force=True, timeout=10000)
-        google_page = popup_info.value
-        clicked = True
-    except Exception:
-        btn = page.locator('div[role="button"]:has-text("Continue with Google")').last
-        try:
-            with page.expect_popup(timeout=20000) as popup_info:
-                btn.click(force=True, timeout=10000)
-            google_page = popup_info.value
-            clicked = True
-        except Exception:
-            pass
-
-    if not clicked:
-        return {"status": "failed", "reason": "Google sign-in button not found"}
-
-    google_page.wait_for_load_state("domcontentloaded", timeout=30000)
-    page.wait_for_timeout(2000)
-
-    # Google account chooser or email entry
-    if "accounts.google.com" in google_page.url:
-        email_input = google_page.locator('input[type="email"], input[name="identifier"]').first
-        try:
-            email_input.wait_for(state="visible", timeout=15000)
-            email_input.fill(EMAIL)
-            google_page.locator("#identifierNext, button:has-text('Next')").first.click()
-            google_page.wait_for_timeout(2500)
-        except PlaywrightTimeout:
-            pass
-
-        password_input = google_page.locator('input[type="password"], input[name="Passwd"]').first
-        try:
-            password_input.wait_for(state="visible", timeout=15000)
-            password_input.fill(PASSWORD)
-            google_page.locator("#passwordNext, button:has-text('Next')").first.click()
-            google_page.wait_for_timeout(5000)
-        except PlaywrightTimeout:
-            pass
-
-    # 2FA / challenge detection
-    page.wait_for_timeout(3000)
-    check_page = google_page if google_page != page else page
-    url = check_page.url
-    try:
-        body = check_page.inner_text("body")[:3000].lower()
-    except Exception:
-        body = page.inner_text("body")[:3000].lower()
-
-    if any(
-        x in url or x in body
-        for x in [
-            "challenge",
-            "signin/v2/challenge",
-            "totp",
-            "verify",
-            "captcha",
-            "recaptcha",
-            "2-step",
-            "two-step",
-            "phone number",
+def inject_li_at_cookie(context) -> bool:
+    token = LI_AT.strip()
+    if not token:
+        return False
+    context.add_cookies(
+        [
+            {
+                "name": "li_at",
+                "value": token,
+                "domain": ".linkedin.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": True,
+            }
         ]
-    ):
-        if "feed" not in url:
-            return {"status": "2fa_blocked", "reason": "Google 2FA/CAPTCHA or verification required"}
+    )
+    return True
 
-    # Wait for LinkedIn redirect (popup may close and set cookies on main page)
-    for _ in range(30):
-        if has_li_at(context):
-            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
-            save_state(context)
-            return {"status": "success", "reason": "Google sign-in completed"}
-        if "linkedin.com/feed" in page.url:
-            save_state(context)
-            return {"status": "success", "reason": "Google sign-in completed"}
-        for p in [page, google_page]:
+
+def page_looks_like_challenge(page) -> bool:
+    url = page.url.lower()
+    if any(h in url for h in CHALLENGE_HINTS):
+        return True
+    try:
+        body = page.inner_text("body")[:4000].lower()
+    except Exception:
+        return False
+    return any(h in body for h in CHALLENGE_HINTS)
+
+
+def try_totp(page) -> bool:
+    if not TOTP_SECRET:
+        return False
+    try:
+        import pyotp
+
+        code = pyotp.TOTP(TOTP_SECRET.replace(" ", "")).now()
+        field = page.locator('input[type="tel"], input[name="totpPin"], input[aria-label*="code" i]').first
+        field.wait_for(state="visible", timeout=8000)
+        field.fill(code)
+        page.locator("#totpNext, button:has-text('Next')").first.click()
+        page.wait_for_timeout(3000)
+        return True
+    except Exception:
+        return False
+
+
+def wait_for_auth_completion(page, google_page, context) -> dict:
+    """Poll up to 5 minutes while user approves phone 2FA on their device."""
+    deadline = time.time() + TFA_MAX_WAIT_SECONDS
+    elapsed = 0
+    challenge_seen = False
+
+    while time.time() < deadline:
+        elapsed = TFA_MAX_WAIT_SECONDS - int(deadline - time.time())
+
+        for active in {page, google_page}:
             try:
-                if "linkedin.com" in p.url and "login" not in p.url and "checkpoint" not in p.url:
+                if has_li_at(context):
                     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
-                    if has_li_at(context):
+                    save_state(context)
+                    return {"status": "success", "reason": "Google sign-in completed (li_at cookie)"}
+                if "linkedin.com/feed" in active.url:
+                    save_state(context)
+                    return {"status": "success", "reason": "Google sign-in completed (feed URL)"}
+                if "linkedin.com" in active.url and "login" not in active.url and "checkpoint" not in active.url:
+                    page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+                    if has_li_at(context) or "feed" in page.url:
                         save_state(context)
-                        return {"status": "success", "reason": "Redirected to LinkedIn"}
+                        return {"status": "success", "reason": "Redirected to LinkedIn after auth"}
             except Exception:
                 pass
-        page.wait_for_timeout(2000)
 
-    if "checkpoint" in page.url or "challenge" in page.url:
-        return {"status": "2fa_blocked", "reason": "LinkedIn checkpoint/challenge page"}
+        on_challenge = page_looks_like_challenge(google_page) or page_looks_like_challenge(page)
+        if on_challenge:
+            challenge_seen = True
+            if try_totp(google_page):
+                continue
+            screenshot(google_page, f"2fa_wait_{elapsed}s")
+            print(f"Waiting for 2FA approval on your phone... ({elapsed}s / {TFA_MAX_WAIT_SECONDS}s)")
+        elif not challenge_seen and elapsed > 15:
+            break
+
+        page.wait_for_timeout(TFA_POLL_SECONDS * 1000)
+
+    if challenge_seen:
+        screenshot(google_page, "2fa_blocked_final")
+        return {
+            "status": "2fa_blocked",
+            "reason": f"Google 2FA still pending after {TFA_MAX_WAIT_SECONDS}s — approve on phone during the run",
+        }
 
     if has_li_at(context):
         save_state(context)
         return {"status": "success", "reason": "li_at cookie present after sign-in attempt"}
 
+    if "checkpoint" in page.url or "challenge" in page.url:
+        return {"status": "2fa_blocked", "reason": "LinkedIn checkpoint/challenge page"}
+
     return {"status": "failed", "reason": f"Could not reach feed; final URL: {page.url}"}
+
+
+def click_google_signin(page):
+    """Return (google_page, clicked). Prefer role-based button (works in non-headless)."""
+    google_page = page
+
+    strategies = [
+        lambda: page.get_by_role("button", name=re.compile(r"Sign in with Google|Continue with Google", re.I)).first,
+        lambda: page.locator('iframe[title*="Sign in with Google"]').last,
+        lambda: page.locator('div[role="button"]:has-text("Continue with Google")').last,
+        lambda: page.locator('div[role="button"]:has-text("Sign in with Google")').last,
+    ]
+
+    for get_locator in strategies:
+        loc = get_locator()
+        try:
+            loc.wait_for(state="visible", timeout=8000)
+            with page.expect_popup(timeout=25000) as popup_info:
+                loc.click(force=True, timeout=10000)
+            google_page = popup_info.value
+            google_page.wait_for_load_state("domcontentloaded", timeout=30000)
+            return google_page, True
+        except Exception:
+            continue
+
+    return google_page, False
+
+
+def fill_google_credentials(google_page):
+    if "accounts.google.com" not in google_page.url:
+        return
+
+    email_input = google_page.locator('input[type="email"], input[name="identifier"]').first
+    try:
+        email_input.wait_for(state="visible", timeout=15000)
+        email_input.click()
+        email_input.fill(EMAIL)
+        google_page.locator("#identifierNext, button:has-text('Next')").first.click()
+        google_page.wait_for_timeout(2500)
+        screenshot(google_page, "01_email_entered")
+    except PlaywrightTimeout:
+        pass
+
+    password_input = google_page.locator('input[type="password"], input[name="Passwd"]').first
+    password_input.wait_for(state="visible", timeout=20000)
+    password_input.click()
+    password_input.fill(PASSWORD)
+    google_page.locator("#passwordNext, button:has-text('Next')").first.click()
+    google_page.wait_for_timeout(3000)
+    screenshot(google_page, "02_password_submitted")
+
+
+def login_via_google(page, context) -> dict:
+    page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(3000)
+
+    if "feed" in page.url or has_li_at(context):
+        return {"status": "success", "reason": "already logged in"}
+
+    google_page, clicked = click_google_signin(page)
+    if not clicked:
+        screenshot(page, "google_button_not_found")
+        return {"status": "failed", "reason": "Google sign-in button not found"}
+
+    fill_google_credentials(google_page)
+    return wait_for_auth_completion(page, google_page, context)
 
 
 def extract_posts(page) -> list[dict]:
@@ -165,7 +249,7 @@ def extract_posts(page) -> list[dict]:
     posts = []
     seen = set()
 
-    for scroll in range(12):
+    for _ in range(12):
         cards = page.locator(
             'div.feed-shared-update-v2, article.main-feed-activity, '
             'div[data-urn*="activity"], li.profile-creator-shared-feed-update__container'
@@ -184,12 +268,12 @@ def extract_posts(page) -> list[dict]:
             seen.add(key)
 
             author = "Unknown"
-            for sel in [
+            for sel in (
                 ".update-components-actor__name span",
                 ".feed-shared-actor__name",
                 "span.feed-shared-actor__title",
                 "a.app-aware-link.update-components-actor__name",
-            ]:
+            ):
                 loc = card.locator(sel).first
                 if loc.count():
                     author = loc.inner_text(timeout=1000).strip().split("\n")[0]
@@ -225,41 +309,25 @@ def classify_post(post: dict) -> dict:
     if not is_relevant and not has_question:
         return {**post, "action": "skip", "draft": "", "priority": 1, "topic": "off-topic"}
 
-    priority = 3
-    if is_relevant:
-        priority += 3
-    if has_question:
-        priority += 2
-    if is_thoughtful:
-        priority += 1
-
+    priority = 3 + (3 if is_relevant else 0) + (2 if has_question else 0) + (1 if is_thoughtful else 0)
     action = "comment" if (has_question or (is_relevant and is_thoughtful)) else "like"
-    draft = ""
-    if action == "comment":
-        draft = draft_comment(text, post["author"])
-
+    draft = draft_comment(text, post["author"]) if action == "comment" else ""
     topic_match = PREFER_KEYWORDS.search(text)
     topic = topic_match.group(0) if topic_match else "general"
 
-    return {
-        **post,
-        "action": action,
-        "draft": draft,
-        "priority": priority,
-        "topic": topic,
-    }
+    return {**post, "action": action, "draft": draft, "priority": priority, "topic": topic}
 
 
 def draft_comment(text: str, author: str) -> str:
     first_name = author.split()[0] if author and author != "Unknown" else "there"
     lower = text.lower()
 
-    if "ai" in lower or "llm" in lower or "machine learning" in lower:
+    if any(k in lower for k in ("ai", "llm", "machine learning")):
         return (
             f"Great perspective, {first_name}. The pace of change in AI is forcing teams to rethink "
             f"how they ship and measure value — curious what you've seen work best in practice."
         )
-    if "leadership" in lower or "manager" in lower or "career" in lower:
+    if any(k in lower for k in ("leadership", "manager", "career")):
         return (
             f"Appreciate you sharing this, {first_name}. These lessons resonate — "
             f"the best leaders I know combine clarity with empathy when stakes are high."
@@ -269,7 +337,7 @@ def draft_comment(text: str, author: str) -> str:
             f"Thoughtful question, {first_name}. In my experience it depends on context, "
             f"but starting with small experiments and tight feedback loops usually surfaces the right path."
         )
-    if "software" in lower or "engineering" in lower or "developer" in lower:
+    if any(k in lower for k in ("software", "engineering", "developer")):
         return (
             f"Solid take, {first_name}. Building reliable systems at scale is as much about culture "
             f"and communication as it is about tooling — thanks for putting this out there."
@@ -278,6 +346,40 @@ def draft_comment(text: str, author: str) -> str:
         f"Thanks for sharing, {first_name}. Really valuable insight — "
         f"always good to see practical experience backed thinking on the feed."
     )
+
+
+def launch_browser(playwright):
+    launch_args = {
+        "headless": False,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    }
+    for channel in ("chrome", "chromium", None):
+        try:
+            kwargs = dict(launch_args)
+            if channel:
+                kwargs["channel"] = channel
+            return playwright.chromium.launch(**kwargs)
+        except Exception:
+            continue
+    return playwright.chromium.launch(headless=True, args=launch_args["args"])
+
+
+def try_existing_session(context, page) -> dict | None:
+    if inject_li_at_cookie(context):
+        page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
+        if "feed" in page.url or has_li_at(context):
+            save_state(context)
+            return {"status": "success", "reason": "Restored session from LINKEDIN_LI_AT secret"}
+
+    page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
+    if "feed" in page.url or has_li_at(context):
+        save_state(context)
+        return {"status": "success", "reason": "Restored session (saved storage state or cookie)"}
+    return None
 
 
 def main():
@@ -294,11 +396,7 @@ def main():
         sys.exit(1)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            channel="chrome",
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = launch_browser(p)
         context_args = {
             "user_agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -314,17 +412,17 @@ def main():
         page = context.new_page()
 
         try:
-            if has_li_at(context):
-                page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
-                if "feed" in page.url or has_li_at(context):
-                    result["login"] = {"status": "success", "reason": "Restored session (li_at cookie)"}
-                else:
-                    result["login"] = login_via_google(page, context)
+            restored = try_existing_session(context, page)
+            if restored:
+                result["login"] = restored
+            elif has_li_at(context):
+                result["login"] = {"status": "success", "reason": "Restored session (li_at cookie)"}
             else:
                 result["login"] = login_via_google(page, context)
 
             if result["login"]["status"] != "success":
                 print(json.dumps(result, indent=2))
+                OUTPUT_FILE.write_text(json.dumps(result, indent=2))
                 browser.close()
                 sys.exit(0)
 
