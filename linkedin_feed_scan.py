@@ -11,7 +11,12 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 SESSION_DIR = Path("/workspace/.linkedin_session")
-SESSION_FILE = SESSION_DIR / "state.json"
+STORAGE_STATE_FILE = Path("/workspace/linkedin_storage_state.json")
+SESSION_FILES = [
+    STORAGE_STATE_FILE,
+    SESSION_DIR / "state.json",
+    Path("/workspace/linkedin_session.json"),
+]
 OUTPUT_FILE = Path("/workspace/feed_results.json")
 SCREENSHOT_DIR = Path("/workspace/login_screenshots")
 
@@ -58,7 +63,8 @@ CHALLENGE_HINTS = (
 
 def save_state(context):
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    context.storage_state(path=str(SESSION_FILE))
+    context.storage_state(path=str(STORAGE_STATE_FILE))
+    context.storage_state(path=str(SESSION_DIR / "state.json"))
 
 
 def screenshot(page, name: str):
@@ -91,6 +97,34 @@ def inject_li_at_cookie(context) -> bool:
         ]
     )
     return True
+
+
+def extract_2fa_tap_info(page) -> dict:
+    """Extract Google tap-number 2FA details from page text."""
+    info = {"tap_number": None, "devices": []}
+    try:
+        body = page.inner_text("body")[:6000]
+    except Exception:
+        return info
+    tap_match = re.search(r"tap\s+(\d{1,3})\b", body, re.I)
+    if tap_match:
+        info["tap_number"] = tap_match.group(1)
+    for device in re.findall(
+        r"(Galaxy [A-Za-z0-9+ ]+|iPhone \d+[A-Za-z+ ]*|Pixel \d+[A-Za-z+ ]*|"
+        r"Google Pixel [A-Za-z0-9+ ]+|Android phone|iPad)",
+        body,
+    ):
+        if device not in info["devices"]:
+            info["devices"].append(device.strip())
+    return info
+
+
+def google_rejected_browser(page) -> bool:
+    try:
+        body = page.inner_text("body")[:3000].lower()
+    except Exception:
+        return False
+    return "this browser or app may not be secure" in body or "couldn't sign you in" in body
 
 
 def page_looks_like_challenge(page) -> bool:
@@ -126,12 +160,15 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
     deadline = time.time() + TFA_MAX_WAIT_SECONDS
     elapsed = 0
     challenge_seen = False
+    tfa_info = {}
 
     while time.time() < deadline:
         elapsed = TFA_MAX_WAIT_SECONDS - int(deadline - time.time())
 
         for active in {page, google_page}:
             try:
+                if active.is_closed():
+                    continue
                 if has_li_at(context):
                     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
                     save_state(context)
@@ -147,23 +184,45 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
             except Exception:
                 pass
 
-        on_challenge = page_looks_like_challenge(google_page) or page_looks_like_challenge(page)
+        try:
+            active_google = google_page if not google_page.is_closed() else page
+            on_challenge = page_looks_like_challenge(active_google) or page_looks_like_challenge(page)
+        except Exception:
+            on_challenge = page_looks_like_challenge(page)
+
         if on_challenge:
             challenge_seen = True
-            if try_totp(google_page):
-                continue
-            screenshot(google_page, f"2fa_wait_{elapsed}s")
-            print(f"Waiting for 2FA approval on your phone... ({elapsed}s / {TFA_MAX_WAIT_SECONDS}s)")
+            try:
+                active_google = google_page if not google_page.is_closed() else page
+                if try_totp(active_google):
+                    continue
+                tfa_info = extract_2fa_tap_info(active_google)
+                screenshot(active_google, f"2fa_wait_{elapsed}s")
+                if tfa_info.get("tap_number") and not tfa_info.get("_alerted"):
+                    tfa_info["_alerted"] = True
+                    devices = ", ".join(tfa_info["devices"]) if tfa_info["devices"] else "your phone"
+                    print(
+                        f"TFA_ALERT|tap={tfa_info['tap_number']}|devices={devices}",
+                        flush=True,
+                    )
+            except Exception:
+                screenshot(page, f"2fa_wait_{elapsed}s")
+            print(f"Waiting for 2FA approval on your phone... ({elapsed}s / {TFA_MAX_WAIT_SECONDS}s)", flush=True)
         elif not challenge_seen and elapsed > 15:
             break
 
         page.wait_for_timeout(TFA_POLL_SECONDS * 1000)
 
     if challenge_seen:
-        screenshot(google_page, "2fa_blocked_final")
+        try:
+            active_google = google_page if not google_page.is_closed() else page
+            screenshot(active_google, "2fa_blocked_final")
+        except Exception:
+            screenshot(page, "2fa_blocked_final")
         return {
             "status": "2fa_blocked",
             "reason": f"Google 2FA still pending after {TFA_MAX_WAIT_SECONDS}s — approve on phone during the run",
+            "tfa": tfa_info,
         }
 
     if has_li_at(context):
@@ -239,6 +298,14 @@ def login_via_google(page, context) -> dict:
         return {"status": "failed", "reason": "Google sign-in button not found"}
 
     fill_google_credentials(google_page)
+
+    try:
+        if not google_page.is_closed() and google_rejected_browser(google_page):
+            screenshot(google_page, "google_rejected")
+            return {"status": "google_rejected", "reason": "Google blocked browser — use computer-use path"}
+    except Exception:
+        pass
+
     return wait_for_auth_completion(page, google_page, context)
 
 
@@ -348,24 +415,23 @@ def draft_comment(text: str, author: str) -> str:
     )
 
 
+def find_session_file() -> Path | None:
+    for path in SESSION_FILES:
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    return None
+
+
 def launch_browser(playwright):
-    launch_args = {
-        "headless": False,
-        "args": [
+    return playwright.chromium.launch(
+        headless=False,
+        channel="chrome",
+        args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
         ],
-    }
-    for channel in ("chrome", "chromium", None):
-        try:
-            kwargs = dict(launch_args)
-            if channel:
-                kwargs["channel"] = channel
-            return playwright.chromium.launch(**kwargs)
-        except Exception:
-            continue
-    return playwright.chromium.launch(headless=True, args=launch_args["args"])
+    )
 
 
 def try_existing_session(context, page) -> dict | None:
@@ -399,14 +465,15 @@ def main():
         browser = launch_browser(p)
         context_args = {
             "user_agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
             "viewport": {"width": 1280, "height": 900},
             "locale": "en-US",
         }
-        if SESSION_FILE.exists():
-            context_args["storage_state"] = str(SESSION_FILE)
+        session_path = find_session_file()
+        if session_path:
+            context_args["storage_state"] = str(session_path)
 
         context = browser.new_context(**context_args)
         page = context.new_page()
