@@ -55,10 +55,18 @@ CHALLENGE_HINTS = (
     "check your",
 )
 
+STORAGE_STATE_FILE = Path("/workspace/linkedin_storage_state.json")
+
+
+def is_on_feed(page) -> bool:
+    url = page.url.lower()
+    return "linkedin.com/feed" in url and "login" not in url and "checkpoint" not in url
+
 
 def save_state(context):
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     context.storage_state(path=str(SESSION_FILE))
+    context.storage_state(path=str(STORAGE_STATE_FILE))
 
 
 def screenshot(page, name: str):
@@ -122,12 +130,16 @@ def try_totp(page) -> bool:
 
 
 def extract_2fa_tap_info(page) -> dict:
-    """Extract Google tap-number 2FA details from the sign-in page."""
-    info: dict = {"tap_number": None, "devices": []}
+    """Extract Google 2FA details (tap-number or tap-yes prompts)."""
+    info: dict = {"tap_number": None, "devices": [], "prompt_type": "number"}
     try:
         body = page.inner_text("body")[:8000]
     except Exception:
         return info
+
+    if re.search(r"tap\s+yes|sent a notification|check your .{0,40}(phone|device)", body, re.I):
+        info["prompt_type"] = "yes"
+        info["tap_number"] = "YES"
 
     for pattern in (
         r"tap\s+(?:number\s+)?(\d{1,3})\b",
@@ -138,6 +150,7 @@ def extract_2fa_tap_info(page) -> dict:
         match = re.search(pattern, body, re.I)
         if match:
             info["tap_number"] = match.group(1)
+            info["prompt_type"] = "number"
             break
 
     for device in re.findall(
@@ -154,13 +167,16 @@ def extract_2fa_tap_info(page) -> dict:
 
 
 def emit_tfa_alert(tfa_info: dict) -> None:
-    """Print tap-number alert immediately — must be first visible output during 2FA."""
+    """Print 2FA alert immediately — must be first visible output during 2FA."""
     num = tfa_info.get("tap_number") or "???"
     devices = tfa_info.get("devices") or []
     device_str = ", ".join(devices) if devices else "your registered phone"
-    line = f"TAP NUMBER: {num} — approve on {device_str} NOW. You have 5 minutes."
+    if tfa_info.get("prompt_type") == "yes" or num == "YES":
+        line = f"TAP YES — approve on {device_str} NOW. You have 5 minutes."
+    else:
+        line = f"TAP NUMBER: {num} — approve on {device_str} NOW. You have 5 minutes."
     print(line, flush=True)
-    print(f"TFA_ALERT|tap={num}|devices={device_str}", flush=True)
+    print(f"TFA_ALERT|tap={num}|devices={device_str}|type={tfa_info.get('prompt_type', 'number')}", flush=True)
     sys.stdout.flush()
 
 
@@ -173,6 +189,52 @@ def _active_google_page(page, google_page):
     return page
 
 
+def _google_popup_closed(google_page, page) -> bool:
+    if google_page is page:
+        return False
+    try:
+        return google_page.is_closed()
+    except Exception:
+        return True
+
+
+def _try_finish_login(page, context) -> dict | None:
+    """Return success dict if LinkedIn session is established."""
+    if has_li_at(context):
+        try:
+            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+        if is_on_feed(page) or has_li_at(context):
+            save_state(context)
+            return {"status": "success", "reason": "Google sign-in completed (li_at cookie)"}
+
+    try:
+        if is_on_feed(page):
+            save_state(context)
+            return {"status": "success", "reason": "Google sign-in completed (feed URL)"}
+    except Exception:
+        pass
+
+    return None
+
+
+def _recover_after_popup_close(page, context) -> dict | None:
+    """After Google popup closes post-2FA, OAuth may finish on the LinkedIn opener."""
+    for attempt in range(6):
+        result = _try_finish_login(page, context)
+        if result:
+            return result
+        try:
+            page.wait_for_timeout(3000)
+            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        print(f"Waiting for LinkedIn session after Google popup closed ({attempt + 1}/6)...", flush=True)
+    return None
+
+
 def wait_for_auth_completion(page, google_page, context) -> dict:
     """Poll up to 5 minutes while user approves phone 2FA on their device."""
     deadline = time.time() + TFA_MAX_WAIT_SECONDS
@@ -180,25 +242,33 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
     challenge_seen = False
     tfa_alert_sent = False
     tfa_info_cached: dict = {}
+    popup_closed_seen = False
 
     while time.time() < deadline:
         elapsed = TFA_MAX_WAIT_SECONDS - int(deadline - time.time())
         active_google = _active_google_page(page, google_page)
 
+        if _google_popup_closed(google_page, page):
+            popup_closed_seen = True
+            challenge_seen = True
+            print("Google popup closed — checking if 2FA was approved...", flush=True)
+            recovered = _recover_after_popup_close(page, context)
+            if recovered:
+                return recovered
+
         for active in {page, active_google}:
             try:
-                if has_li_at(context):
-                    page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
-                    save_state(context)
-                    return {"status": "success", "reason": "Google sign-in completed (li_at cookie)"}
-                if "linkedin.com/feed" in active.url:
+                result = _try_finish_login(page, context)
+                if result:
+                    return result
+                if "linkedin.com/feed" in active.url and is_on_feed(active):
                     save_state(context)
                     return {"status": "success", "reason": "Google sign-in completed (feed URL)"}
                 if "linkedin.com" in active.url and "login" not in active.url and "checkpoint" not in active.url:
                     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
-                    if has_li_at(context) or "feed" in page.url:
-                        save_state(context)
-                        return {"status": "success", "reason": "Redirected to LinkedIn after auth"}
+                    result = _try_finish_login(page, context)
+                    if result:
+                        return result
             except Exception:
                 pass
 
@@ -223,24 +293,34 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
             elif not tfa_alert_sent:
                 screenshot(active_google, f"2fa_wait_{elapsed}s")
                 print(
-                    f"TAP NUMBER: ??? — check 2fa_alert screenshot. Waiting ({elapsed}s / {TFA_MAX_WAIT_SECONDS}s)",
+                    f"TAP YES — approve on your phone NOW. Waiting ({elapsed}s / {TFA_MAX_WAIT_SECONDS}s)",
                     flush=True,
                 )
-        elif not challenge_seen and elapsed > 15:
+        elif challenge_seen and not popup_closed_seen:
+            # 2FA screen gone but popup still open — user may have approved; keep polling
+            result = _try_finish_login(page, context)
+            if result:
+                return result
+        elif not challenge_seen and elapsed > 15 and not popup_closed_seen:
             break
 
         page.wait_for_timeout(TFA_POLL_SECONDS * 1000)
 
+    if popup_closed_seen:
+        recovered = _recover_after_popup_close(page, context)
+        if recovered:
+            return recovered
+
     if challenge_seen:
-        screenshot(google_page, "2fa_blocked_final")
+        screenshot(active_google if not _google_popup_closed(google_page, page) else page, "2fa_blocked_final")
         return {
             "status": "2fa_blocked",
             "reason": f"Google 2FA still pending after {TFA_MAX_WAIT_SECONDS}s — approve on phone during the run",
         }
 
-    if has_li_at(context):
-        save_state(context)
-        return {"status": "success", "reason": "li_at cookie present after sign-in attempt"}
+    result = _try_finish_login(page, context)
+    if result:
+        return result
 
     if "checkpoint" in page.url or "challenge" in page.url:
         return {"status": "2fa_blocked", "reason": "LinkedIn checkpoint/challenge page"}
@@ -302,7 +382,7 @@ def login_via_google(page, context) -> dict:
     page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(3000)
 
-    if "feed" in page.url or has_li_at(context):
+    if is_on_feed(page) or (has_li_at(context) and "login" not in page.url):
         return {"status": "success", "reason": "already logged in"}
 
     google_page, clicked = click_google_signin(page)
@@ -443,12 +523,12 @@ def launch_browser(playwright):
 def try_existing_session(context, page) -> dict | None:
     if inject_li_at_cookie(context):
         page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
-        if "feed" in page.url or has_li_at(context):
+        if is_on_feed(page):
             save_state(context)
             return {"status": "success", "reason": "Restored session from LINKEDIN_LI_AT secret"}
 
     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
-    if "feed" in page.url or has_li_at(context):
+    if is_on_feed(page):
         save_state(context)
         return {"status": "success", "reason": "Restored session (saved storage state or cookie)"}
     return None
@@ -479,6 +559,8 @@ def main():
         }
         if SESSION_FILE.exists():
             context_args["storage_state"] = str(SESSION_FILE)
+        elif STORAGE_STATE_FILE.exists():
+            context_args["storage_state"] = str(STORAGE_STATE_FILE)
 
         context = browser.new_context(**context_args)
         page = context.new_page()
