@@ -289,7 +289,7 @@ def login_via_google(page, context) -> dict:
     page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(3000)
 
-    if "feed" in page.url or has_li_at(context):
+    if is_feed_page(page.url) or has_li_at(context):
         return {"status": "success", "reason": "already logged in"}
 
     google_page, clicked = click_google_signin(page)
@@ -434,17 +434,30 @@ def launch_browser(playwright):
     )
 
 
+def is_feed_page(url: str) -> bool:
+    parsed = url.split("?")[0].rstrip("/")
+    return parsed.endswith("linkedin.com/feed") or "/feed/" in parsed and "login" not in url.split("?")[0]
+
+
 def try_existing_session(context, page) -> dict | None:
+    session_path = find_session_file()
+    if session_path:
+        try:
+            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+            if is_feed_page(page.url) and has_li_at(context):
+                save_state(context)
+                return {"status": "success", "reason": f"Restored session from {session_path.name}"}
+        except Exception:
+            pass
+
     if inject_li_at_cookie(context):
         page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
-        if "feed" in page.url or has_li_at(context):
+        page.wait_for_timeout(2000)
+        if is_feed_page(page.url) and has_li_at(context):
             save_state(context)
             return {"status": "success", "reason": "Restored session from LINKEDIN_LI_AT secret"}
 
-    page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
-    if "feed" in page.url or has_li_at(context):
-        save_state(context)
-        return {"status": "success", "reason": "Restored session (saved storage state or cookie)"}
     return None
 
 
@@ -481,11 +494,20 @@ def main():
         try:
             restored = try_existing_session(context, page)
             if restored:
-                result["login"] = restored
-            elif has_li_at(context):
-                result["login"] = {"status": "success", "reason": "Restored session (li_at cookie)"}
+                result["login"] = {**restored, "method": "session_restore"}
+            elif has_li_at(context) and is_feed_page(page.url):
+                result["login"] = {"status": "success", "reason": "Restored session (li_at cookie)", "method": "session_restore"}
             else:
-                result["login"] = login_via_google(page, context)
+                login_result = login_via_google(page, context)
+                login_result["method"] = "chrome_playwright"
+                result["login"] = login_result
+
+                if result["login"].get("status") == "google_rejected":
+                    result["login"]["method"] = "computer_use_needed"
+                    print(json.dumps(result, indent=2))
+                    OUTPUT_FILE.write_text(json.dumps(result, indent=2))
+                    browser.close()
+                    sys.exit(0)
 
             if result["login"]["status"] != "success":
                 print(json.dumps(result, indent=2))
