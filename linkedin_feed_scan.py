@@ -56,9 +56,18 @@ CHALLENGE_HINTS = (
 )
 
 
+STORAGE_STATE_FILE = Path("/workspace/linkedin_storage_state.json")
+
+
+def is_on_feed(page) -> bool:
+    url = page.url.lower()
+    return "linkedin.com/feed" in url and "login" not in url and "checkpoint" not in url
+
+
 def save_state(context):
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     context.storage_state(path=str(SESSION_FILE))
+    context.storage_state(path=str(STORAGE_STATE_FILE))
 
 
 def screenshot(page, name: str):
@@ -196,7 +205,7 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
                     return {"status": "success", "reason": "Google sign-in completed (feed URL)"}
                 if "linkedin.com" in active.url and "login" not in active.url and "checkpoint" not in active.url:
                     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
-                    if has_li_at(context) or "feed" in page.url:
+                    if is_on_feed(page) or has_li_at(context):
                         save_state(context)
                         return {"status": "success", "reason": "Redirected to LinkedIn after auth"}
             except Exception:
@@ -302,7 +311,7 @@ def login_via_google(page, context) -> dict:
     page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(3000)
 
-    if "feed" in page.url or has_li_at(context):
+    if is_on_feed(page) or (has_li_at(context) and "login" not in page.url):
         return {"status": "success", "reason": "already logged in"}
 
     google_page, clicked = click_google_signin(page)
@@ -443,12 +452,12 @@ def launch_browser(playwright):
 def try_existing_session(context, page) -> dict | None:
     if inject_li_at_cookie(context):
         page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
-        if "feed" in page.url or has_li_at(context):
+        if is_on_feed(page):
             save_state(context)
             return {"status": "success", "reason": "Restored session from LINKEDIN_LI_AT secret"}
 
     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
-    if "feed" in page.url or has_li_at(context):
+    if is_on_feed(page):
         save_state(context)
         return {"status": "success", "reason": "Restored session (saved storage state or cookie)"}
     return None
@@ -479,6 +488,8 @@ def main():
         }
         if SESSION_FILE.exists():
             context_args["storage_state"] = str(SESSION_FILE)
+        elif STORAGE_STATE_FILE.exists():
+            context_args["storage_state"] = str(STORAGE_STATE_FILE)
 
         context = browser.new_context(**context_args)
         page = context.new_page()
