@@ -19,6 +19,7 @@ EMAIL = os.environ.get("LINKEDIN_EMAIL", "")
 PASSWORD = os.environ.get("GOOGLE_PASSORD", "")
 AUTH_METHOD = os.environ.get("LINKEDIN_AUTH_METHOD", "")
 LI_AT = os.environ.get("LINKEDIN_LI_AT", "")
+SKIP_LI_AT = os.environ.get("LINKEDIN_SKIP_LI_AT", "").lower() in ("1", "true", "yes")
 TOTP_SECRET = os.environ.get("GOOGLE_TOTP_SECRET", "")
 
 TFA_POLL_SECONDS = 10
@@ -84,7 +85,7 @@ def has_li_at(context) -> bool:
 
 def inject_li_at_cookie(context) -> bool:
     token = LI_AT.strip()
-    if not token:
+    if not token or SKIP_LI_AT:
         return False
     context.add_cookies(
         [
@@ -99,6 +100,17 @@ def inject_li_at_cookie(context) -> bool:
         ]
     )
     return True
+
+
+def clear_li_at_cookie(context) -> None:
+    """Remove injected li_at so a stale cookie cannot block Google OAuth."""
+    try:
+        keep = [c for c in context.cookies("https://www.linkedin.com") if c["name"] != "li_at"]
+        context.clear_cookies()
+        if keep:
+            context.add_cookies(keep)
+    except Exception:
+        pass
 
 
 def page_looks_like_challenge(page) -> bool:
@@ -522,10 +534,21 @@ def launch_browser(playwright):
 
 def try_existing_session(context, page) -> dict | None:
     if inject_li_at_cookie(context):
-        page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
-        if is_on_feed(page):
+        try:
+            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+        except Exception as exc:
+            clear_li_at_cookie(context)
+            print(f"LINKEDIN_LI_AT rejected by LinkedIn cloud session: {exc}", flush=True)
+        elif is_on_feed(page):
             save_state(context)
             return {"status": "success", "reason": "Restored session from LINKEDIN_LI_AT secret"}
+        else:
+            clear_li_at_cookie(context)
+            print(
+                "LINKEDIN_LI_AT did not reach feed (likely stale or home-browser-only) — using Google OAuth",
+                flush=True,
+            )
 
     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
     if is_on_feed(page):
@@ -569,9 +592,9 @@ def main():
             restored = try_existing_session(context, page)
             if restored:
                 result["login"] = restored
-            elif has_li_at(context):
-                result["login"] = {"status": "success", "reason": "Restored session (li_at cookie)"}
             else:
+                if has_li_at(context) and not is_on_feed(page):
+                    clear_li_at_cookie(context)
                 result["login"] = login_via_google(page, context)
 
             if result["login"]["status"] != "success":
