@@ -180,16 +180,7 @@ def _google_popup_closed(google_page, page) -> bool:
 
 
 def _try_finish_login(page, context) -> dict | None:
-    """Return success dict if LinkedIn session is established."""
-    if has_li_at(context):
-        try:
-            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
-        except Exception:
-            pass
-        if is_on_feed(page) or has_li_at(context):
-            save_state(context)
-            return {"status": "success", "reason": "Google sign-in completed (li_at cookie)"}
-
+    """Return success dict only when the feed is actually reachable."""
     try:
         if is_on_feed(page):
             save_state(context)
@@ -197,6 +188,18 @@ def _try_finish_login(page, context) -> dict | None:
     except Exception:
         pass
 
+    if not has_li_at(context):
+        return None
+
+    try:
+        page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2000)
+    except Exception:
+        return None
+
+    if is_on_feed(page):
+        save_state(context)
+        return {"status": "success", "reason": "Google sign-in completed (li_at cookie)"}
     return None
 
 
@@ -220,6 +223,65 @@ def _check_all_pages(context, page) -> dict | None:
     return _try_finish_login(page, context)
 
 
+def _pick_google_account(google_page) -> None:
+    """Choose the configured Google account if an account picker appears."""
+    try:
+        account = google_page.locator(f'div[data-email="{EMAIL}"], [data-identifier="{EMAIL}"]').first
+        if account.count():
+            account.click(timeout=5000)
+            google_page.wait_for_timeout(2000)
+            return
+    except Exception:
+        pass
+    try:
+        google_page.locator(f'text={EMAIL}').first.click(timeout=3000)
+        google_page.wait_for_timeout(2000)
+    except Exception:
+        pass
+
+
+def _retry_google_signin_after_approval(page, context) -> dict | None:
+    """After phone 2FA, Google trusts this browser — a second OAuth attempt often completes."""
+    print("Retrying Google sign-in after 2FA approval...", flush=True)
+    try:
+        page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2500)
+    except Exception:
+        return None
+
+    google_page, clicked = click_google_signin(page)
+    if not clicked:
+        return None
+
+    try:
+        if "accounts.google.com" in google_page.url:
+            _pick_google_account(google_page)
+            if page_looks_like_challenge(google_page):
+                return None
+    except Exception:
+        pass
+
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        result = _check_all_pages(context, page)
+        if result:
+            return result
+        try:
+            if not google_page.is_closed():
+                if "linkedin.com" in google_page.url:
+                    result = _check_all_pages(context, page)
+                    if result:
+                        return result
+                if page_looks_like_challenge(google_page):
+                    page.wait_for_timeout(TFA_POLL_SECONDS * 1000)
+                    continue
+        except Exception:
+            pass
+        page.wait_for_timeout(TFA_POLL_SECONDS * 1000)
+
+    return _check_all_pages(context, page)
+
+
 def _recover_after_popup_close(page, context) -> dict | None:
     """After Google popup closes post-2FA, OAuth may finish on any tab or via cookies."""
     attempts = max(1, TFA_RECOVERY_SECONDS // 4)
@@ -229,8 +291,7 @@ def _recover_after_popup_close(page, context) -> dict | None:
             return result
         try:
             page.wait_for_timeout(4000)
-            if not is_on_feed(page):
-                page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2000)
         except Exception:
             pass
@@ -246,25 +307,32 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
     tfa_alert_sent = False
     tfa_info_cached: dict = {}
     popup_closed_seen = False
+    oauth_retry_done = False
     challenge_started_at = 0.0
 
     while time.time() < deadline:
         elapsed = int(time.time() - (deadline - TFA_MAX_WAIT_SECONDS))
         active_google = _active_google_page(page, google_page)
 
-        if _google_popup_closed(google_page, page):
-            if not popup_closed_seen:
-                popup_closed_seen = True
-                print("Google popup closed — checking if 2FA was approved...", flush=True)
-            recovered = _recover_after_popup_close(page, context)
-            if recovered:
-                return recovered
-            # Keep waiting — approval may still be propagating
-            deadline = max(deadline, time.time() + 60)
-
         result = _check_all_pages(context, page)
         if result:
             return result
+
+        popup_closed = _google_popup_closed(google_page, page)
+        if popup_closed and not popup_closed_seen:
+            popup_closed_seen = True
+            print("Google popup closed — checking if 2FA was approved...", flush=True)
+
+        if popup_closed and challenge_seen and not oauth_retry_done:
+            oauth_retry_done = True
+            retried = _retry_google_signin_after_approval(page, context)
+            if retried:
+                return retried
+
+        if popup_closed:
+            result = _check_all_pages(context, page)
+            if result:
+                return result
 
         on_challenge = False
         for candidate in (active_google, page):
@@ -301,12 +369,19 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
                     f"TAP YES — approve on your phone NOW. Waiting ({elapsed}s / {TFA_MAX_WAIT_SECONDS}s)",
                     flush=True,
                 )
-        elif challenge_seen and not popup_closed_seen:
-            result = _check_all_pages(context, page)
-            if result:
-                return result
+        elif challenge_seen and not popup_closed:
+            try:
+                if not active_google.is_closed() and not page_looks_like_challenge(active_google):
+                    print("Google left 2FA screen — waiting for LinkedIn redirect...", flush=True)
+            except Exception:
+                pass
 
         page.wait_for_timeout(TFA_POLL_SECONDS * 1000)
+
+    if challenge_seen and not oauth_retry_done:
+        retried = _retry_google_signin_after_approval(page, context)
+        if retried:
+            return retried
 
     if popup_closed_seen or challenge_seen:
         recovered = _recover_after_popup_close(page, context)
@@ -333,8 +408,6 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
 
 def click_google_signin(page):
     """Return (google_page, clicked). Prefer role-based button (works in non-headless)."""
-    google_page = page
-
     strategies = [
         lambda: page.get_by_role("button", name=re.compile(r"Sign in with Google|Continue with Google", re.I)).first,
         lambda: page.locator('iframe[title*="Sign in with Google"]').last,
@@ -346,6 +419,21 @@ def click_google_signin(page):
         loc = get_locator()
         try:
             loc.wait_for(state="visible", timeout=8000)
+        except Exception:
+            continue
+
+        # Same-tab sign-in survives 2FA better than a popup that closes early.
+        try:
+            loc.click(force=True, timeout=10000)
+            page.wait_for_url(re.compile(r"accounts\.google\.com|linkedin\.com/feed"), timeout=20000)
+            if "accounts.google.com" in page.url:
+                return page, True
+            if is_on_feed(page):
+                return page, True
+        except Exception:
+            pass
+
+        try:
             with page.expect_popup(timeout=25000) as popup_info:
                 loc.click(force=True, timeout=10000)
             google_page = popup_info.value
@@ -354,7 +442,7 @@ def click_google_signin(page):
         except Exception:
             continue
 
-    return google_page, False
+    return page, False
 
 
 def fill_google_credentials(google_page):
