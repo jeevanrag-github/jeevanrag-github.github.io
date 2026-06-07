@@ -407,31 +407,30 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
 
 
 def click_google_signin(page):
-    """Return (google_page, clicked). Prefer role-based button (works in non-headless)."""
+    """Return (google_page, clicked). GSI button lives inside an iframe on LinkedIn login."""
+    iframe = page.locator('iframe[title*="Sign in with Google"]').last
+    gsi_button = page.frame_locator('iframe[title*="Sign in with Google"]').last.locator(
+        'div[role="button"], button'
+    ).first
+
     strategies = [
-        lambda: page.get_by_role("button", name=re.compile(r"Sign in with Google|Continue with Google", re.I)).first,
-        lambda: page.locator('iframe[title*="Sign in with Google"]').last,
-        lambda: page.locator('div[role="button"]:has-text("Continue with Google")').last,
-        lambda: page.locator('div[role="button"]:has-text("Sign in with Google")').last,
+        ("gsi_iframe_button", gsi_button),
+        ("gsi_iframe", iframe),
+        (
+            "role_button",
+            page.get_by_role(
+                "button", name=re.compile(r"Sign in with Google|Continue with Google", re.I)
+            ).first,
+        ),
+        ("div_role_continue", page.locator('div[role="button"]:has-text("Continue with Google")').last),
+        ("div_role_signin", page.locator('div[role="button"]:has-text("Sign in with Google")').last),
     ]
 
-    for get_locator in strategies:
-        loc = get_locator()
+    for _name, loc in strategies:
         try:
             loc.wait_for(state="visible", timeout=8000)
         except Exception:
             continue
-
-        # Same-tab sign-in survives 2FA better than a popup that closes early.
-        try:
-            loc.click(force=True, timeout=10000)
-            page.wait_for_url(re.compile(r"accounts\.google\.com|linkedin\.com/feed"), timeout=20000)
-            if "accounts.google.com" in page.url:
-                return page, True
-            if is_on_feed(page):
-                return page, True
-        except Exception:
-            pass
 
         try:
             with page.expect_popup(timeout=25000) as popup_info:
@@ -439,6 +438,14 @@ def click_google_signin(page):
             google_page = popup_info.value
             google_page.wait_for_load_state("domcontentloaded", timeout=30000)
             return google_page, True
+        except Exception:
+            pass
+
+        try:
+            loc.click(force=True, timeout=10000)
+            page.wait_for_url(re.compile(r"accounts\.google\.com|linkedin\.com/feed"), timeout=20000)
+            if "accounts.google.com" in page.url or is_on_feed(page):
+                return page, True
         except Exception:
             continue
 
