@@ -619,7 +619,11 @@ def try_existing_session(context, page) -> dict | None:
     return None
 
 
+SCRIPT_REVISION = "b917380"
+
+
 def main():
+    print(f"linkedin_feed_scan revision={SCRIPT_REVISION}", flush=True)
     result = {
         "login": {"status": "pending", "reason": ""},
         "posts": [],
