@@ -406,10 +406,24 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
     return {"status": "failed", "reason": f"Could not reach feed; final URL: {page.url}"}
 
 
+def _google_page_from_context(context, page):
+    """Return an open Google OAuth tab if one already exists."""
+    for candidate in context.pages:
+        try:
+            if "accounts.google.com" in candidate.url:
+                return candidate
+        except Exception:
+            pass
+    if "accounts.google.com" in page.url:
+        return page
+    return None
+
+
 def click_google_signin(page):
     """Return (google_page, clicked). Prefer role-based button (works in non-headless)."""
     strategies = [
         lambda: page.get_by_role("button", name=re.compile(r"Sign in with Google|Continue with Google", re.I)).first,
+        lambda: page.locator('div[role="button"]').filter(has_text=re.compile(r"Continue with Google|Sign in with Google", re.I)).first,
         lambda: page.locator('iframe[title*="Sign in with Google"]').last,
         lambda: page.locator('div[role="button"]:has-text("Continue with Google")').last,
         lambda: page.locator('div[role="button"]:has-text("Sign in with Google")').last,
@@ -422,23 +436,27 @@ def click_google_signin(page):
         except Exception:
             continue
 
-        # Same-tab sign-in survives 2FA better than a popup that closes early.
-        try:
-            loc.click(force=True, timeout=10000)
-            page.wait_for_url(re.compile(r"accounts\.google\.com|linkedin\.com/feed"), timeout=20000)
-            if "accounts.google.com" in page.url:
-                return page, True
-            if is_on_feed(page):
-                return page, True
-        except Exception:
-            pass
-
+        # LinkedIn opens Google OAuth in a popup — listen before clicking.
         try:
             with page.expect_popup(timeout=25000) as popup_info:
                 loc.click(force=True, timeout=10000)
             google_page = popup_info.value
             google_page.wait_for_load_state("domcontentloaded", timeout=30000)
             return google_page, True
+        except Exception:
+            existing = _google_page_from_context(page.context, page)
+            if existing:
+                return existing, True
+
+        try:
+            loc.click(force=True, timeout=10000)
+            page.wait_for_timeout(2500)
+            existing = _google_page_from_context(page.context, page)
+            if existing:
+                return existing, True
+            page.wait_for_url(re.compile(r"accounts\.google\.com|linkedin\.com/feed"), timeout=15000)
+            if "accounts.google.com" in page.url or is_on_feed(page):
+                return page, True
         except Exception:
             continue
 
@@ -619,7 +637,7 @@ def try_existing_session(context, page) -> dict | None:
     return None
 
 
-SCRIPT_REVISION = "b917380"
+SCRIPT_REVISION = "c4f8a21"
 
 
 def main():
