@@ -225,6 +225,12 @@ def emit_tfa_alert(tfa_info: dict) -> None:
     print(line, flush=True)
     print(f"TFA_ALERT|tap={num}|devices={device_str}|type={tfa_info.get('prompt_type', 'number')}", flush=True)
     sys.stdout.flush()
+    try:
+        from gmail_mcp_notify import send_tfa_email
+
+        send_tfa_email(tfa_info)
+    except Exception as exc:
+        print(f"GMAIL_MCP|email_failed|error={exc}", flush=True)
 
 
 def _active_google_page(page, google_page):
@@ -728,7 +734,7 @@ def try_existing_session(context, page) -> dict | None:
     return None
 
 
-SCRIPT_REVISION = "d8e3a91"
+SCRIPT_REVISION = "e2f9b04"
 
 
 def main():
