@@ -20,8 +20,8 @@ PASSWORD = os.environ.get("GOOGLE_PASSORD", "")
 AUTH_METHOD = os.environ.get("LINKEDIN_AUTH_METHOD", "")
 TOTP_SECRET = os.environ.get("GOOGLE_TOTP_SECRET", "")
 
-TFA_POLL_SECONDS = 10
-TFA_MAX_WAIT_SECONDS = 300
+TFA_POLL_SECONDS = 5
+TFA_MAX_WAIT_SECONDS = 90  # 2SV disabled; short wait if Google shows unexpected challenge
 
 SKIP_KEYWORDS = re.compile(
     r"\b(hiring now|we're hiring|apply now|job opening|limited time offer|"
