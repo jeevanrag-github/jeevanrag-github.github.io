@@ -406,6 +406,40 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
     return {"status": "failed", "reason": f"Could not reach feed; final URL: {page.url}"}
 
 
+def _popup_from_click(page, loc):
+    """Click Google sign-in and return the Google page (popup or same-tab)."""
+    existing = {p.url for p in page.context.pages if not p.is_closed()}
+
+    try:
+        with page.expect_popup(timeout=25000) as popup_info:
+            loc.click(force=True, timeout=10000)
+        google_page = popup_info.value
+        google_page.wait_for_load_state("domcontentloaded", timeout=30000)
+        return google_page
+    except Exception:
+        pass
+
+    for candidate in page.context.pages:
+        try:
+            if candidate.is_closed():
+                continue
+            if candidate.url not in existing and "accounts.google.com" in candidate.url:
+                candidate.wait_for_load_state("domcontentloaded", timeout=30000)
+                return candidate
+        except Exception:
+            pass
+
+    try:
+        loc.click(force=True, timeout=10000)
+        page.wait_for_url(re.compile(r"accounts\.google\.com|linkedin\.com/feed"), timeout=20000)
+        if "accounts.google.com" in page.url or is_on_feed(page):
+            return page
+    except Exception:
+        pass
+
+    return None
+
+
 def click_google_signin(page):
     """Return (google_page, clicked). Prefer role-based button (works in non-headless)."""
     strategies = [
@@ -422,25 +456,9 @@ def click_google_signin(page):
         except Exception:
             continue
 
-        # Same-tab sign-in survives 2FA better than a popup that closes early.
-        try:
-            loc.click(force=True, timeout=10000)
-            page.wait_for_url(re.compile(r"accounts\.google\.com|linkedin\.com/feed"), timeout=20000)
-            if "accounts.google.com" in page.url:
-                return page, True
-            if is_on_feed(page):
-                return page, True
-        except Exception:
-            pass
-
-        try:
-            with page.expect_popup(timeout=25000) as popup_info:
-                loc.click(force=True, timeout=10000)
-            google_page = popup_info.value
-            google_page.wait_for_load_state("domcontentloaded", timeout=30000)
+        google_page = _popup_from_click(page, loc)
+        if google_page is not None:
             return google_page, True
-        except Exception:
-            continue
 
     return page, False
 
@@ -619,7 +637,7 @@ def try_existing_session(context, page) -> dict | None:
     return None
 
 
-SCRIPT_REVISION = "b917380"
+SCRIPT_REVISION = "c4a8f21"
 
 
 def main():
