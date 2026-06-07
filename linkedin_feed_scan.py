@@ -21,7 +21,8 @@ AUTH_METHOD = os.environ.get("LINKEDIN_AUTH_METHOD", "")
 TOTP_SECRET = os.environ.get("GOOGLE_TOTP_SECRET", "")
 
 TFA_POLL_SECONDS = 5
-TFA_MAX_WAIT_SECONDS = 90  # 2SV disabled; short wait if Google shows unexpected challenge
+TFA_MAX_WAIT_SECONDS = 300
+TFA_RECOVERY_SECONDS = 120
 
 SKIP_KEYWORDS = re.compile(
     r"\b(hiring now|we're hiring|apply now|job opening|limited time offer|"
@@ -199,62 +200,86 @@ def _try_finish_login(page, context) -> dict | None:
     return None
 
 
+def _check_all_pages(context, page) -> dict | None:
+    """Check every open tab for a completed LinkedIn session."""
+    pages = list(dict.fromkeys([page, *context.pages]))
+    for active in pages:
+        try:
+            if active.is_closed():
+                continue
+            if "linkedin.com/feed" in active.url and is_on_feed(active):
+                save_state(context)
+                return {"status": "success", "reason": "Google sign-in completed (feed URL)"}
+            if "linkedin.com" in active.url and "login" not in active.url and "checkpoint" not in active.url:
+                page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+                result = _try_finish_login(page, context)
+                if result:
+                    return result
+        except Exception:
+            pass
+    return _try_finish_login(page, context)
+
+
 def _recover_after_popup_close(page, context) -> dict | None:
-    """After Google popup closes post-2FA, OAuth may finish on the LinkedIn opener."""
-    for attempt in range(6):
-        result = _try_finish_login(page, context)
+    """After Google popup closes post-2FA, OAuth may finish on any tab or via cookies."""
+    attempts = max(1, TFA_RECOVERY_SECONDS // 4)
+    for attempt in range(attempts):
+        result = _check_all_pages(context, page)
         if result:
             return result
         try:
-            page.wait_for_timeout(3000)
-            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(4000)
+            if not is_on_feed(page):
+                page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2000)
         except Exception:
             pass
-        print(f"Waiting for LinkedIn session after Google popup closed ({attempt + 1}/6)...", flush=True)
+        print(f"Waiting for LinkedIn session after Google popup closed ({attempt + 1}/{attempts})...", flush=True)
     return None
 
 
 def wait_for_auth_completion(page, google_page, context) -> dict:
-    """Poll up to 5 minutes while user approves phone 2FA on their device."""
+    """Poll while user approves phone 2FA; detect success on any tab or after popup closes."""
     deadline = time.time() + TFA_MAX_WAIT_SECONDS
     elapsed = 0
     challenge_seen = False
     tfa_alert_sent = False
     tfa_info_cached: dict = {}
     popup_closed_seen = False
+    challenge_started_at = 0.0
 
     while time.time() < deadline:
-        elapsed = TFA_MAX_WAIT_SECONDS - int(deadline - time.time())
+        elapsed = int(time.time() - (deadline - TFA_MAX_WAIT_SECONDS))
         active_google = _active_google_page(page, google_page)
 
         if _google_popup_closed(google_page, page):
-            popup_closed_seen = True
-            challenge_seen = True
-            print("Google popup closed — checking if 2FA was approved...", flush=True)
+            if not popup_closed_seen:
+                popup_closed_seen = True
+                print("Google popup closed — checking if 2FA was approved...", flush=True)
             recovered = _recover_after_popup_close(page, context)
             if recovered:
                 return recovered
+            # Keep waiting — approval may still be propagating
+            deadline = max(deadline, time.time() + 60)
 
-        for active in {page, active_google}:
+        result = _check_all_pages(context, page)
+        if result:
+            return result
+
+        on_challenge = False
+        for candidate in (active_google, page):
             try:
-                result = _try_finish_login(page, context)
-                if result:
-                    return result
-                if "linkedin.com/feed" in active.url and is_on_feed(active):
-                    save_state(context)
-                    return {"status": "success", "reason": "Google sign-in completed (feed URL)"}
-                if "linkedin.com" in active.url and "login" not in active.url and "checkpoint" not in active.url:
-                    page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
-                    result = _try_finish_login(page, context)
-                    if result:
-                        return result
+                if not candidate.is_closed() and page_looks_like_challenge(candidate):
+                    on_challenge = True
+                    break
             except Exception:
                 pass
 
-        on_challenge = page_looks_like_challenge(active_google) or page_looks_like_challenge(page)
         if on_challenge:
-            challenge_seen = True
+            if not challenge_seen:
+                challenge_seen = True
+                challenge_started_at = time.time()
+                deadline = max(deadline, time.time() + TFA_MAX_WAIT_SECONDS)
             if try_totp(active_google):
                 continue
 
@@ -277,25 +302,23 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
                     flush=True,
                 )
         elif challenge_seen and not popup_closed_seen:
-            # 2FA screen gone but popup still open — user may have approved; keep polling
-            result = _try_finish_login(page, context)
+            result = _check_all_pages(context, page)
             if result:
                 return result
-        elif not challenge_seen and elapsed > 15 and not popup_closed_seen:
-            break
 
         page.wait_for_timeout(TFA_POLL_SECONDS * 1000)
 
-    if popup_closed_seen:
+    if popup_closed_seen or challenge_seen:
         recovered = _recover_after_popup_close(page, context)
         if recovered:
             return recovered
 
     if challenge_seen:
         screenshot(active_google if not _google_popup_closed(google_page, page) else page, "2fa_blocked_final")
+        waited = int(time.time() - challenge_started_at) if challenge_started_at else TFA_MAX_WAIT_SECONDS
         return {
             "status": "2fa_blocked",
-            "reason": f"Google 2FA still pending after {TFA_MAX_WAIT_SECONDS}s — approve on phone during the run",
+            "reason": f"Google 2FA still pending after {waited}s — approve on phone during the run",
         }
 
     result = _try_finish_login(page, context)
