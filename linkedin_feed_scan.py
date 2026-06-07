@@ -23,6 +23,7 @@ TOTP_SECRET = os.environ.get("GOOGLE_TOTP_SECRET", "")
 TFA_POLL_SECONDS = 5
 TFA_MAX_WAIT_SECONDS = 300
 TFA_RECOVERY_SECONDS = 120
+POST_2FA_RETRY_SECONDS = 12
 
 SKIP_KEYWORDS = re.compile(
     r"\b(hiring now|we're hiring|apply now|job opening|limited time offer|"
@@ -42,17 +43,19 @@ POLITICAL = re.compile(
     re.I,
 )
 CHALLENGE_HINTS = (
-    "challenge",
     "signin/v2/challenge",
+    "challenge/pk/presend",
+    "challenge/ipp",
     "totp",
-    "verify",
     "captcha",
     "recaptcha",
-    "2-step",
-    "two-step",
-    "phone number",
+    "2-step verification",
+    "two-step verification",
     "tap yes",
-    "check your",
+    "check your galaxy",
+    "check your iphone",
+    "check your pixel",
+    "check your phone",
 )
 
 STORAGE_STATE_FILE = Path("/workspace/linkedin_storage_state.json")
@@ -84,13 +87,76 @@ def has_li_at(context) -> bool:
 
 def page_looks_like_challenge(page) -> bool:
     url = page.url.lower()
-    if any(h in url for h in CHALLENGE_HINTS):
+    if any(h in url for h in ("signin/v2/challenge", "challenge/pk", "challenge/ipp")):
         return True
     try:
         body = page.inner_text("body")[:4000].lower()
     except Exception:
         return False
     return any(h in body for h in CHALLENGE_HINTS)
+
+
+def _close_google_popup(google_page, page) -> None:
+    """Close a stale Google OAuth popup so a fresh sign-in can start."""
+    if google_page is page:
+        return
+    try:
+        if not google_page.is_closed():
+            google_page.close()
+    except Exception:
+        pass
+
+
+def _click_first_visible(google_page, selectors: list[str], timeout: int = 3000) -> bool:
+    for selector in selectors:
+        try:
+            loc = google_page.locator(selector).first
+            if loc.count() and loc.is_visible():
+                loc.click(timeout=timeout)
+                google_page.wait_for_timeout(1500)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _advance_google_oauth(google_page) -> None:
+    """Auto-complete Google OAuth screens after 2FA — no human clicks required."""
+    if google_page.is_closed():
+        return
+
+    url = google_page.url.lower()
+    _pick_google_account(google_page)
+
+    if "gsi/select" in url or "oauth" in url or "signin/oauth" in url:
+        _click_first_visible(
+            google_page,
+            [
+                f'[data-email="{EMAIL}"]',
+                f'[data-identifier="{EMAIL}"]',
+                'div[role="button"]:has-text("Continue")',
+                'button:has-text("Continue")',
+                '[data-action="select"]',
+            ],
+        )
+
+    _click_first_visible(
+        google_page,
+        [
+            'button:has-text("Continue")',
+            'button:has-text("Allow")',
+            'button:has-text("Accept")',
+            '#submit_approve_access',
+            'input[type="submit"][value="Allow"]',
+            'div[role="button"]:has-text("Continue")',
+            'div[role="button"]:has-text("Allow")',
+        ],
+    )
+
+    try:
+        google_page.wait_for_url(re.compile(r"linkedin\.com|gsi/fedcm|about:blank"), timeout=8000)
+    except Exception:
+        pass
 
 
 def try_totp(page) -> bool:
@@ -240,9 +306,11 @@ def _pick_google_account(google_page) -> None:
         pass
 
 
-def _retry_google_signin_after_approval(page, context) -> dict | None:
+def _retry_google_signin_after_approval(page, context, google_page=None) -> dict | None:
     """After phone 2FA, Google trusts this browser — a second OAuth attempt often completes."""
     print("Retrying Google sign-in after 2FA approval...", flush=True)
+    if google_page is not None:
+        _close_google_popup(google_page, page)
     try:
         page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2500)
@@ -256,6 +324,7 @@ def _retry_google_signin_after_approval(page, context) -> dict | None:
     try:
         if "accounts.google.com" in google_page.url:
             _pick_google_account(google_page)
+            _advance_google_oauth(google_page)
             if page_looks_like_challenge(google_page):
                 return None
     except Exception:
@@ -268,6 +337,7 @@ def _retry_google_signin_after_approval(page, context) -> dict | None:
             return result
         try:
             if not google_page.is_closed():
+                _advance_google_oauth(google_page)
                 if "linkedin.com" in google_page.url:
                     result = _check_all_pages(context, page)
                     if result:
@@ -309,6 +379,7 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
     popup_closed_seen = False
     oauth_retry_done = False
     challenge_started_at = 0.0
+    challenge_cleared_at = 0.0
 
     while time.time() < deadline:
         elapsed = int(time.time() - (deadline - TFA_MAX_WAIT_SECONDS))
@@ -325,7 +396,7 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
 
         if popup_closed and challenge_seen and not oauth_retry_done:
             oauth_retry_done = True
-            retried = _retry_google_signin_after_approval(page, context)
+            retried = _retry_google_signin_after_approval(page, context, google_page)
             if retried:
                 return retried
 
@@ -344,6 +415,7 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
                 pass
 
         if on_challenge:
+            challenge_cleared_at = 0.0
             if not challenge_seen:
                 challenge_seen = True
                 challenge_started_at = time.time()
@@ -369,17 +441,36 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
                     f"TAP YES — approve on your phone NOW. Waiting ({elapsed}s / {TFA_MAX_WAIT_SECONDS}s)",
                     flush=True,
                 )
-        elif challenge_seen and not popup_closed:
+        elif challenge_seen:
+            if not challenge_cleared_at:
+                challenge_cleared_at = time.time()
+                print("2FA approved — auto-completing Google OAuth redirect...", flush=True)
+                screenshot(active_google if not popup_closed else page, "post_2fa")
+
             try:
-                if not active_google.is_closed() and not page_looks_like_challenge(active_google):
-                    print("Google left 2FA screen — waiting for LinkedIn redirect...", flush=True)
+                if not active_google.is_closed():
+                    _advance_google_oauth(active_google)
+                    popup_url = active_google.url
+                    if popup_url and "accounts.google.com" in popup_url:
+                        print(f"Google OAuth in progress: {popup_url[:100]}", flush=True)
             except Exception:
                 pass
+
+            if (
+                not oauth_retry_done
+                and challenge_cleared_at
+                and time.time() - challenge_cleared_at >= POST_2FA_RETRY_SECONDS
+            ):
+                oauth_retry_done = True
+                retried = _retry_google_signin_after_approval(page, context, google_page)
+                if retried:
+                    return retried
+                print("OAuth retry did not finish — continuing recovery...", flush=True)
 
         page.wait_for_timeout(TFA_POLL_SECONDS * 1000)
 
     if challenge_seen and not oauth_retry_done:
-        retried = _retry_google_signin_after_approval(page, context)
+        retried = _retry_google_signin_after_approval(page, context, google_page)
         if retried:
             return retried
 
@@ -637,7 +728,7 @@ def try_existing_session(context, page) -> dict | None:
     return None
 
 
-SCRIPT_REVISION = "c4a8f21"
+SCRIPT_REVISION = "d8e3a91"
 
 
 def main():
