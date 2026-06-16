@@ -18,7 +18,6 @@ SCREENSHOT_DIR = Path("/workspace/login_screenshots")
 EMAIL = os.environ.get("LINKEDIN_EMAIL", "")
 PASSWORD = os.environ.get("GOOGLE_PASSORD", "")
 AUTH_METHOD = os.environ.get("LINKEDIN_AUTH_METHOD", "")
-TOTP_SECRET = os.environ.get("GOOGLE_TOTP_SECRET", "")
 
 TFA_POLL_SECONDS = 5
 TFA_MAX_WAIT_SECONDS = 300
@@ -91,23 +90,6 @@ def page_looks_like_challenge(page) -> bool:
     except Exception:
         return False
     return any(h in body for h in CHALLENGE_HINTS)
-
-
-def try_totp(page) -> bool:
-    if not TOTP_SECRET:
-        return False
-    try:
-        import pyotp
-
-        code = pyotp.TOTP(TOTP_SECRET.replace(" ", "")).now()
-        field = page.locator('input[type="tel"], input[name="totpPin"], input[aria-label*="code" i]').first
-        field.wait_for(state="visible", timeout=8000)
-        field.fill(code)
-        page.locator("#totpNext, button:has-text('Next')").first.click()
-        page.wait_for_timeout(3000)
-        return True
-    except Exception:
-        return False
 
 
 def extract_2fa_tap_info(page) -> dict:
@@ -348,9 +330,6 @@ def wait_for_auth_completion(page, google_page, context) -> dict:
                 challenge_seen = True
                 challenge_started_at = time.time()
                 deadline = max(deadline, time.time() + TFA_MAX_WAIT_SECONDS)
-            if try_totp(active_google):
-                continue
-
             tfa_info = extract_2fa_tap_info(active_google)
             if not tfa_info.get("tap_number"):
                 tfa_info = extract_2fa_tap_info(page)
@@ -619,7 +598,7 @@ def try_existing_session(context, page) -> dict | None:
     return None
 
 
-SCRIPT_REVISION = "b917380"
+SCRIPT_REVISION = "remove-totp-secret"
 
 
 def main():
